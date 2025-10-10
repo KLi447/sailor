@@ -1,0 +1,8 @@
+[
+    {
+        "instruction": "Could you provide an introduction to mLoRA?",
+        "instruction_paraphrased": "Tell me about mLoRA",
+        "chosen": "mLoRA, short for Multi-LoRA Fine-Tune, is an open-source framework designed for efficient fine-tuning of Large Language Models using LoRA and its variants.",
+        "reject": "mLoRA is an open-source framework designed for efficient fine-tuning of Large Language Models using LoRA"
+    }
+]
