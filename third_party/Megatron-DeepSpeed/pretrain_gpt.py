@@ -21,6 +21,8 @@ from megatron.arguments import core_transformer_config_from_args
 import deepspeed
 from deepspeed.runtime.utils import see_memory_usage
 from deepspeed.accelerator.real_accelerator import get_accelerator
+from deepspeed.runtime.engine import params_tp_dim_dict
+
 import os
 import subprocess
 
@@ -117,6 +119,14 @@ def model_provider(pre_process=True, post_process=True, use_embedding=True, use_
                 post_process=post_process
             )
     see_memory_usage(f"After Building Model", force=True)
+
+    for name, param in model.named_parameters():
+        # strip preceding #.
+        name = name[2:]
+        if "lora_A" in name:
+            params_tp_dim_dict[name] = 1
+        elif "lora_B" in name:
+            params_tp_dim_dict[name] = 0
     return model
 
 

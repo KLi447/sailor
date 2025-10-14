@@ -9,7 +9,7 @@ from .module import MegatronModule, fp32_to_float16, float16_to_fp32
 from .utils import init_method_normal, scaled_init_method_normal, attention_mask_func
 
 from .language_model import EmbeddingPipe
-from .transformer import ParallelTransformerLayerPipe, LMHeadPipe, get_num_experts_per_layer
+from .transformer import ParallelTransformerLayerPipe, LMHeadPipe, get_num_experts_per_layer, LoRAColumnParallelLinear, LoRARowParallelLinear
 from .enums import AttnMaskType, AttnType
 from megatron.model import LayerNorm, RMSNorm
 
@@ -291,12 +291,17 @@ class OPTParallelAttention(MegatronModule):
 
          # Strided linear layer.
         if attention_type == AttnType.self_attn:
-            self.query_key_value = tensor_parallel.ColumnParallelLinear(
-                self.embed_dim,
-                3 * self.embed_dim,
-                config=config,
-                gather_output=False,
-                init_method=self.init_method)
+            if args.enable_lora and 'qkv' in args.lora_target_modules:
+                self.query_key_value = LoRAColumnParallelLinear(
+                    self.embed_dim, 3 * self.embed_dim,
+                    lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+                    config=config, gather_output=False, init_method=self.init_method
+                )
+            else:
+                self.query_key_value = tensor_parallel.ColumnParallelLinear(
+                    self.embed_dim, 3 * self.embed_dim,
+                    config=config, gather_output=False, init_method=self.init_method
+                )
 
         coeff = None
         self.scale_mask_softmax = FusedScaleMaskSoftmax(
@@ -308,13 +313,17 @@ class OPTParallelAttention(MegatronModule):
             coeff)
 
         # Output.
-        self.dense = tensor_parallel.RowParallelLinear(
-            self.embed_dim,
-            self.embed_dim,
-            config=config,
-            input_is_parallel=True,
-            init_method=self.output_layer_init_method,
-            skip_bias_add=True)
+        if args.enable_lora and 'dense' in args.lora_target_modules:
+            self.dense = LoRARowParallelLinear(
+                self.embed_dim, self.embed_dim,
+                lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+                config=config, input_is_parallel=True, init_method=self.output_layer_init_method, skip_bias_add=True
+            )
+        else:
+            self.dense = tensor_parallel.RowParallelLinear(
+                self.embed_dim, self.embed_dim,
+                config=config, input_is_parallel=True, init_method=self.output_layer_init_method, skip_bias_add=True
+            )
 
 
     def forward(self, hidden_states, attention_mask, layer_past=None,
@@ -470,26 +479,30 @@ class OPTParallelTransformerLayer(MegatronModule):
         self.activation_fn = F.relu
 
         self.self_attn_layer_norm = LayerNorm(self.embed_dim)
-        self.fc1 = tensor_parallel.ColumnParallelLinear(
-            self.embed_dim,
-            args.ffn_hidden_size,
-            config=config,
-            gather_output=False,
-            init_method=init_method,
-            skip_bias_add=True,
-            moe=moe,
-            enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
-        )
+        
+        if args.enable_lora and 'fc1' in args.lora_target_modules:
+            self.fc1 = LoRAColumnParallelLinear(
+                self.embed_dim, args.ffn_hidden_size,
+                lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+                config=config, gather_output=False, init_method=init_method, skip_bias_add=True
+            )
+        else:
+            self.fc1 = tensor_parallel.ColumnParallelLinear(
+                self.embed_dim, args.ffn_hidden_size,
+                config=config, gather_output=False, init_method=init_method, skip_bias_add=True
+            )
 
-        self.fc2 = tensor_parallel.RowParallelLinear(
-            args.ffn_hidden_size,
-            self.embed_dim,
-            config=config,
-            input_is_parallel=True,
-            init_method=output_layer_init_method,
-            skip_bias_add=True,
-            moe=moe,
-            enable_expert_tensor_parallelism=enable_expert_tensor_parallelism)
+        if args.enable_lora and 'fc2' in args.lora_target_modules:
+            self.fc2 = LoRARowParallelLinear(
+                args.ffn_hidden_size, self.embed_dim,
+                lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+                config=config, input_is_parallel=True, init_method=output_layer_init_method, skip_bias_add=True
+            )
+        else:
+            self.fc2 = tensor_parallel.RowParallelLinear(
+                args.ffn_hidden_size, self.embed_dim,
+                config=config, input_is_parallel=True, init_method=output_layer_init_method, skip_bias_add=True
+            )
 
         self.final_layer_norm = LayerNorm(self.embed_dim)
 

@@ -14,6 +14,12 @@ import deepspeed.comm as dist
 from megatron import get_timers, get_args, get_retro_args, core, get_num_microbatches
 from .module import MegatronModule
 from megatron.core import parallel_state, tensor_parallel, mpu
+from megatron.core.tensor_parallel import (
+            gather_from_tensor_model_parallel_region,
+            copy_to_tensor_model_parallel_region,
+            scatter_to_tensor_model_parallel_region,
+            reduce_from_tensor_model_parallel_region,
+        )
 from megatron.core.enums import ModelType
 from megatron.model import LayerNorm, RMSNorm
 from megatron.model.enums import AttnMaskType, LayerType, AttnType
@@ -114,7 +120,7 @@ class ParallelMLP(MegatronModule):
             ffn_hidden_size *= 2
 
         # Project to 4h. If using swiglu double the output width, see https://arxiv.org/pdf/2002.05202.pdf
-        self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
+        dense_h_to_4h_layer = tensor_parallel.ColumnParallelLinear(
             config.hidden_size,
             ffn_hidden_size,
             config=config,
@@ -125,6 +131,15 @@ class ParallelMLP(MegatronModule):
             moe=moe,
             enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
         )
+        if args.enable_lora and 'mlp_h_to_4h' in args.lora_target_modules:
+            self.dense_h_to_4h = LoRAParallelLinear(
+                dense_h_to_4h_layer,
+                args.lora_rank,
+                args.lora_alpha,
+                args.lora_dropout
+            )
+        else:
+            self.dense_h_to_4h = dense_h_to_4h_layer
 
         self.bias_gelu_fusion = False
         self.activation_func = None
@@ -148,7 +163,7 @@ class ParallelMLP(MegatronModule):
             self.activation_func = F.gelu
 
         # Project back to h.
-        self.dense_4h_to_h = tensor_parallel.RowParallelLinear(
+        dense_4h_to_h_layer = tensor_parallel.RowParallelLinear(
             config.ffn_hidden_size,
             config.hidden_size,
             config=config,
@@ -158,6 +173,15 @@ class ParallelMLP(MegatronModule):
             moe=moe,
             enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
         )
+        if args.enable_lora and 'mlp_4h_to_h' in args.lora_target_modules:
+            self.dense_4h_to_h = LoRAParallelLinear(
+                dense_4h_to_h_layer,
+                args.lora_rank,
+                args.lora_alpha,
+                args.lora_dropout
+            )
+        else:
+            self.dense_4h_to_h = dense_4h_to_h_layer
 
         self.ds_sequence_parallel_fpdt = args.ds_sequence_parallel_fpdt
         if self.ds_sequence_parallel_fpdt:
@@ -577,13 +601,22 @@ class ParallelAttention(MegatronModule):
 
         # Strided linear layer.
         if attention_type == AttnType.self_attn:
-            self.query_key_value = tensor_parallel.ColumnParallelLinear(
+            qkv_layer = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
                 projection_size + 2 * kv_projection_size,
                 config=config,
                 init_method=config.init_method,
                 bias=args.add_bias_linear,
                 gather_output=False)
+            if args.enable_lora and 'qkv' in args.lora_target_modules:
+                self.query_key_value = LoRAParallelLinear(
+                    qkv_layer,
+                    args.lora_rank,
+                    args.lora_alpha,
+                    args.lora_dropout
+                )
+            else:
+                self.query_key_value = qkv_layer
         else:
             assert attention_type == AttnType.cross_attn
             self.query = tensor_parallel.ColumnParallelLinear(
@@ -629,7 +662,7 @@ class ParallelAttention(MegatronModule):
                 self.checkpoint_core_attention = config.recompute_granularity == 'selective'
 
         # Output.
-        self.dense = tensor_parallel.RowParallelLinear(
+        dense_layer = tensor_parallel.RowParallelLinear(
             projection_size,
             config.hidden_size,
             config=config,
@@ -637,6 +670,15 @@ class ParallelAttention(MegatronModule):
             bias=args.add_bias_linear,
             input_is_parallel=True,
             skip_bias_add=True)
+        if args.enable_lora and 'dense' in args.lora_target_modules:
+            self.dense = LoRAParallelLinear(
+                dense_layer,
+                args.lora_rank,
+                args.lora_alpha,
+                args.lora_dropout
+            )
+        else:
+            self.dense = dense_layer
 
 
     def _checkpointed_attention_forward(self, query_layer, key_layer,
@@ -1479,6 +1521,138 @@ class ParallelTransformerLayer(MegatronModule):
             return output, retriever_output, moe_loss
         else:
             return output, moe_loss
+
+
+class LoRAColumnParallelLinear(tensor_parallel.ColumnParallelLinear):
+    def __init__(self, *args, lora_rank=8, lora_alpha=16, lora_dropout=0.0, **kwargs):
+        super(LoRAColumnParallelLinear, self).__init__(*args, **kwargs)
+
+        self.r = lora_rank
+        self.lora_alpha = lora_alpha
+        self.lora_dropout = torch.nn.Dropout(lora_dropout)
+        self.scaling = self.lora_alpha / self.r
+
+        config = kwargs['config']
+        self.params_dtype = config.params_dtype
+
+        self.lora_A = torch.nn.Parameter(torch.empty(
+            self.r, self.input_size,
+            device=get_accelerator().current_device_name(),
+            dtype=self.params_dtype
+        ))
+        self.lora_B = torch.nn.Parameter(torch.empty(
+            self.output_size_per_partition, self.r,
+            device=get_accelerator().current_device_name(),
+            dtype=self.params_dtype
+        ))
+
+        setattr(self.lora_A, "tp_register", True)
+        setattr(self.lora_A, "partition_dim", 1)
+        setattr(self.lora_A, "partition_stride", getattr(self, "stride", 1))
+        setattr(self.lora_A, "tensor_model_parallel", False)
+
+        setattr(self.lora_B, "tp_register", True)
+        setattr(self.lora_B, "partition_dim", 0)
+        setattr(self.lora_B, "partition_stride", getattr(self, "stride", 1))
+        setattr(self.lora_B, "tensor_model_parallel", True)
+
+        torch.nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        torch.nn.init.zeros_(self.lora_B)
+
+    def forward(self, input_):
+        self.weight.requires_grad = False
+        if self.bias is not None:
+            self.bias.requires_grad = False
+
+        original_output, original_bias = super().forward(input_)
+
+        from megatron.core.tensor_parallel.mappings import (
+            copy_to_tensor_model_parallel_region,
+            gather_from_tensor_model_parallel_region,
+        )
+
+        if getattr(self, "async_tensor_model_parallel_allreduce", False) \
+                or getattr(self, "sequence_parallel", False) \
+                or getattr(self, "is_expert_without_slicing", False):
+            input_parallel = input_
+        else:
+            input_parallel = copy_to_tensor_model_parallel_region(input_)
+
+        lora_A_output = F.linear(self.lora_dropout(input_parallel), self.lora_A)
+        lora_B_output = F.linear(lora_A_output, self.lora_B)
+        lora_output_parallel = lora_B_output * self.scaling
+
+        if getattr(self, "gather_output", False) and not getattr(self, "is_expert_without_slicing", False):
+            lora_output = gather_from_tensor_model_parallel_region(lora_output_parallel)
+        else:
+            lora_output = lora_output_parallel
+
+        return original_output + lora_output, original_bias
+
+
+class LoRARowParallelLinear(tensor_parallel.RowParallelLinear):
+    def __init__(self, *args, lora_rank=8, lora_alpha=16, lora_dropout=0.0, **kwargs):
+        super(LoRARowParallelLinear, self).__init__(*args, **kwargs)
+
+        self.r = lora_rank
+        self.lora_alpha = lora_alpha
+        self.lora_dropout = torch.nn.Dropout(lora_dropout)
+        self.scaling = self.lora_alpha / self.r
+
+        config = kwargs['config']
+        self.params_dtype = config.params_dtype
+
+        self.lora_A = torch.nn.Parameter(torch.empty(
+            self.r, self.input_size_per_partition,
+            device=get_accelerator().current_device_name(),
+            dtype=self.params_dtype
+        ))
+        self.lora_B = torch.nn.Parameter(torch.empty(
+            self.output_size, self.r,
+            device=get_accelerator().current_device_name(),
+            dtype=self.params_dtype
+        ))
+
+        setattr(self.lora_A, "tp_register", True)
+        setattr(self.lora_A, "partition_dim", 1)
+        setattr(self.lora_A, "partition_stride", getattr(self, "stride", 1))
+        setattr(self.lora_A, "tensor_model_parallel", True)
+
+        setattr(self.lora_B, "tp_register", True)
+        setattr(self.lora_B, "partition_dim", 0)
+        setattr(self.lora_B, "partition_stride", getattr(self, "stride", 1))
+        setattr(self.lora_B, "tensor_model_parallel", False)
+
+        torch.nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        torch.nn.init.zeros_(self.lora_B)
+
+    def forward(self, input_):
+        self.weight.requires_grad = False
+        if self.bias is not None:
+            self.bias.requires_grad = False
+
+        if getattr(self, "input_is_parallel", False) or getattr(self, "is_expert_without_slicing", False):
+            input_parallel = input_
+        else:
+            input_parallel = scatter_to_tensor_model_parallel_region(input_)
+
+        lora_A_output = F.linear(self.lora_dropout(input_parallel), self.lora_A)
+        lora_B_output = F.linear(lora_A_output, self.lora_B)
+        lora_output_parallel = lora_B_output * self.scaling
+
+        output_parallel = F.linear(input_parallel, self.weight)
+        output_parallel = output_parallel + lora_output_parallel
+
+        output_ = reduce_from_tensor_model_parallel_region(output_parallel)
+
+        if not self.skip_bias_add:
+            output = output_ + self.bias if self.bias is not None else output_
+            output_bias = None
+        else:
+            output = output_
+            output_bias = self.bias
+
+        return output, output_bias
 
 
 class ParallelTransformerLayerPipe(ParallelTransformerLayer):

@@ -64,7 +64,7 @@ from sailor.profiling.profile_utils import (
     alloc_res_mem
 )
 from sailor.Planner.baselines.Galvatron.core import GalvatronProfiler
-from sailor.Worker.checkpoint.chk_manager import Chk_manager
+from sailor.Worker.chk_manager import Chk_manager
 
 try:
     import wandb
@@ -96,6 +96,25 @@ def _create_ds_config_dict():
     args.deepspeed_config = None
 
     return ds_config_dict
+
+def get_lora_params(model_chunks):
+    lora_params = []
+    for chunk in model_chunks:
+        for name, param in chunk.named_parameters():
+            if 'lora_' in name:
+                lora_params.append(param)
+    return lora_params
+
+def load_lora_config(args):
+    args = get_args()
+    if args.lora_config_file:
+        print_rank_0(f"> Loading LoRA configuration from {args.lora_config_file}")
+        with open(args.lora_config_file, 'r') as f:
+            lora_config = json.load(f)
+        for key, value in lora_config.items():
+            setattr(args, key, value)
+    else:
+        setattr(args, 'enable_lora', False)
 
 # called every time a restart happens
 def restart(
@@ -238,6 +257,7 @@ def pretrain(train_valid_test_dataset_provider,
         args_defaults=args_defaults,
         external_args=external_args
     )
+    load_lora_config(all_args)
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     if get_accelerator().device_name() == 'cuda':
@@ -938,6 +958,17 @@ def load_model_weights_only(model_provider_func):
     optimizer = None
     lr_scheduler = None
 
+    if args.enable_lora:
+        print_rank_0("LoRA is enabled. Freezing base model weights.")
+        for param in model[0].parameters():
+            param.requires_grad = False
+        
+        optimizer_params = get_lora_params(model)
+
+        print_rank_0(f"Found {len(optimizer_params)} trainable LoRA parameters.")
+        for param in optimizer_params:
+            param.requires_grad = True
+
     if args.deepspeed:
         # When loading just the model weights, ZeRO can be disabled.
         if 'zero_optimization' in args.deepspeed_config_dict:
@@ -945,7 +976,7 @@ def load_model_weights_only(model_provider_func):
 
         model, optimizer, _, lr_scheduler = deepspeed.initialize(
             model=model[0],
-            config=args.deepspeed_config_dict
+            config=args.deepspeed_config_dict,
         )
 
         assert not isinstance(model, deepspeed.PipelineEngine), \

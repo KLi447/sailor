@@ -239,3 +239,7 @@ nsys/*
 # Aceso
 *.pkl
 aceso_logs/
+
+# More things
+third_party/data
+third_party/logs

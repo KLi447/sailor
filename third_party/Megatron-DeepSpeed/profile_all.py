@@ -39,7 +39,7 @@ def run(bs, tp_size, pp_size, model_name, results_dir, num_prof_layers, profile=
         json.dump(ds_conf, f, indent=2)
 
     config = model_configs[model_name]
-    home_dir = "/root"
+    home_dir = "/projects/beis/kli44"
 
     cmd = (
         f"deepspeed pretrain_gpt.py "
@@ -75,6 +75,7 @@ def run(bs, tp_size, pp_size, model_name, results_dir, num_prof_layers, profile=
         f"--gpu-type A100 "
         f"--train-iters 10 "
 	    f"--results-dir {results_dir} "
+        f"--lora-config-file {home_dir}/sailor/lora_config.json "
     )
     if profile == "sailor":
         cmd += "--sailor-profile "
