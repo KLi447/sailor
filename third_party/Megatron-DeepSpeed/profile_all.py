@@ -16,7 +16,8 @@ model_configs = {
     "OPT-350": ModelConfig(24, 1024, 16, 2048, "OPT"),
     "GPT-Neo-2.7": ModelConfig(32, 2560, 20, 2048, "GPT-Neo"),
     "OPT-30": ModelConfig(48, 7168, 56, 2048, "OPT"),
-    "LLAMA-3-8": ModelConfig(32, 4096, 32, 8192, "LLAMA")
+    "LLAMA-3-8": ModelConfig(32, 4096, 32, 1024, "LLAMA"),
+    "QWEN-3-8" : ModelConfig(32, 4096, 8, 1024, "QWEN")
 }
 
 def run(bs, tp_size, pp_size, model_name, results_dir, num_prof_layers, profile=None, use_embedding=False, use_transformer=False, use_last=False):
@@ -59,7 +60,7 @@ def run(bs, tp_size, pp_size, model_name, results_dir, num_prof_layers, profile=
         f"--log-interval 1 "
         f"--eval-iters 40 "
         f"--eval-interval 1000 "
-        f"--data-path {home_dir}/sailor/third_party/Megatron-DeepSpeed/data/meg-gpt2-oscar-en-10k_text_document "
+        f"--data-path {home_dir}/sailor/third_party/Megatron-DeepSpeed/data/meg-gpt2-gsm8k-1k_text_document "
         f"--vocab-file {home_dir}/sailor/third_party/Megatron-DeepSpeed/data/gpt2-vocab.json "
         f"--merge-file {home_dir}/sailor/third_party/Megatron-DeepSpeed/data/gpt2-merges.txt "
         f"--save-interval 1000 "
@@ -76,6 +77,8 @@ def run(bs, tp_size, pp_size, model_name, results_dir, num_prof_layers, profile=
         f"--train-iters 10 "
 	    f"--results-dir {results_dir} "
         f"--lora-config-file {home_dir}/sailor/lora_config.json "
+        f"--use-triton-lora True "
+        f"--enable-lora True "
     )
     if profile == "sailor":
         cmd += "--sailor-profile "
@@ -116,7 +119,7 @@ if __name__ == "__main__":
         "--pp", type=int, required=True, help="Pipeline parallelism"
     )
     parser.add_argument(
-        "--max_bs", type=int, required=True, help="Maximum micro batch size"
+        "--bs", type=int, required=True, help="Micro batch size"
     )
     parser.add_argument(
         "--model_name", type=str, required=True, help="Model name"
@@ -138,16 +141,12 @@ if __name__ == "__main__":
 
     tp = args.tp
     pp = args.pp
-    max_bs = args.max_bs
+    bs = args.bs
     model_name = args.model_name
     results_dir = args.results_dir
     num_prof_layers = args.num_prof_layers
 
-    bs_list = []
-    bs = 1
-    while bs <= args.max_bs:
-        bs_list.append(bs)
-        bs *= 2
+    bs_list = [args.bs]
 
     run_all(
         bs_list,

@@ -1008,7 +1008,9 @@ def _add_training_args(parser):
     group.add_argument('--use-last', action='store_true', help='Varuna-specific. Use the last layer')
     group.add_argument('--layers-per-stage', type=str, required=False, default=None, help='Layer partitioning into stages')
     group.add_argument('--pccheck-threads', type=int, required=False, default=1, help='PCcheck threads')
+    group.add_argument('--enable-lora', type=bool, required=False, default=False, help='Enable/Disable LoRA fine tuning.')
     group.add_argument('--lora-config-file', type=str, default=None, help='Path to the LoRA configuration JSON file.')
+    group.add_argument('--use-triton-lora', type=bool, default=False, help='If set to True, use optimized Triton kernel for batched LoRA.')
 
     return parser
 

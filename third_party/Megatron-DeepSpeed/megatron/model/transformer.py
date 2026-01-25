@@ -6,9 +6,11 @@ from contextlib import nullcontext
 import math
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
-from typing import Optional
+from typing import Optional, Dict, List, Any
+from dataclasses import dataclass
 import deepspeed.comm as dist
 
 from megatron import get_timers, get_args, get_retro_args, core, get_num_microbatches
@@ -37,6 +39,12 @@ try:
     dist_attn_supported = True
 except ImportError:
     dist_attn_supported = False
+
+try:
+    from kernel import OptimizedLoRAFunction
+    triton_lora_available = True
+except ImportError:
+    triton_lora_available = False
 
 try:
     from einops import rearrange
@@ -120,26 +128,30 @@ class ParallelMLP(MegatronModule):
             ffn_hidden_size *= 2
 
         # Project to 4h. If using swiglu double the output width, see https://arxiv.org/pdf/2002.05202.pdf
-        dense_h_to_4h_layer = tensor_parallel.ColumnParallelLinear(
-            config.hidden_size,
-            ffn_hidden_size,
-            config=config,
-            init_method=config.init_method,
-            bias=self.add_bias,
-            gather_output=False,
-            skip_bias_add=True,
-            moe=moe,
-            enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
-        )
-        if args.enable_lora and 'mlp_h_to_4h' in args.lora_target_modules:
-            self.dense_h_to_4h = LoRAParallelLinear(
-                dense_h_to_4h_layer,
-                args.lora_rank,
-                args.lora_alpha,
-                args.lora_dropout
+        if args.enable_lora:
+            self.dense_h_to_4h = LoRAColumnParallelLinear(
+                config.hidden_size,
+                ffn_hidden_size,
+                config=config,
+                init_method=config.init_method,
+                bias=self.add_bias,
+                gather_output=False,
+                skip_bias_add=True,
+                moe=moe,
+                enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
             )
         else:
-            self.dense_h_to_4h = dense_h_to_4h_layer
+            self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
+                config.hidden_size,
+                ffn_hidden_size,
+                config=config,
+                init_method=config.init_method,
+                bias=self.add_bias,
+                gather_output=False,
+                skip_bias_add=True,
+                moe=moe,
+                enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
+            )
 
         self.bias_gelu_fusion = False
         self.activation_func = None
@@ -163,25 +175,28 @@ class ParallelMLP(MegatronModule):
             self.activation_func = F.gelu
 
         # Project back to h.
-        dense_4h_to_h_layer = tensor_parallel.RowParallelLinear(
-            config.ffn_hidden_size,
-            config.hidden_size,
-            config=config,
-            init_method=config.output_layer_init_method,
-            bias=self.add_bias,
-            input_is_parallel=True,
-            moe=moe,
-            enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
-        )
-        if args.enable_lora and 'mlp_4h_to_h' in args.lora_target_modules:
-            self.dense_4h_to_h = LoRAParallelLinear(
-                dense_4h_to_h_layer,
-                args.lora_rank,
-                args.lora_alpha,
-                args.lora_dropout
+        if args.enable_lora:
+            self.dense_4h_to_h = LoRARowParallelLinear(
+                config.ffn_hidden_size,
+                config.hidden_size,
+                config=config,
+                init_method=config.output_layer_init_method,
+                bias=self.add_bias,
+                input_is_parallel=True,
+                moe=moe,
+                enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
             )
         else:
-            self.dense_4h_to_h = dense_4h_to_h_layer
+            self.dense_4h_to_h = tensor_parallel.RowParallelLinear(
+                config.ffn_hidden_size,
+                config.hidden_size,
+                config=config,
+                init_method=config.output_layer_init_method,
+                bias=self.add_bias,
+                input_is_parallel=True,
+                moe=moe,
+                enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
+            )
 
         self.ds_sequence_parallel_fpdt = args.ds_sequence_parallel_fpdt
         if self.ds_sequence_parallel_fpdt:
@@ -601,40 +616,56 @@ class ParallelAttention(MegatronModule):
 
         # Strided linear layer.
         if attention_type == AttnType.self_attn:
-            qkv_layer = tensor_parallel.ColumnParallelLinear(
-                config.hidden_size,
-                projection_size + 2 * kv_projection_size,
-                config=config,
-                init_method=config.init_method,
-                bias=args.add_bias_linear,
-                gather_output=False)
-            if args.enable_lora and 'qkv' in args.lora_target_modules:
-                self.query_key_value = LoRAParallelLinear(
-                    qkv_layer,
-                    args.lora_rank,
-                    args.lora_alpha,
-                    args.lora_dropout
+            if args.enable_lora:
+                self.query_key_value = LoRAColumnParallelLinear(
+                    config.hidden_size,
+                    projection_size + 2 * kv_projection_size,
+                    config=config,
+                    init_method=config.init_method,
+                    bias=args.add_bias_linear,
+                    gather_output=False
                 )
             else:
-                self.query_key_value = qkv_layer
+                self.query_key_value = tensor_parallel.ColumnParallelLinear(
+                    config.hidden_size,
+                    projection_size + 2 * kv_projection_size,
+                    config=config,
+                    init_method=config.init_method,
+                    bias=args.add_bias_linear,
+                    gather_output=False)
         else:
             assert attention_type == AttnType.cross_attn
-            self.query = tensor_parallel.ColumnParallelLinear(
-                config.hidden_size,
-                projection_size,
-                config=config,
-                init_method=config.init_method,
-                bias=config.add_bias_linear,
-                gather_output=False)
+            if args.enable_lora:
+                self.query = LoRAColumnParallelLinear(config.hidden_size,
+                    projection_size,
+                    config=config,
+                    init_method=config.init_method,
+                    bias=config.add_bias_linear,
+                    gather_output=False)
+            else:
+                self.query = tensor_parallel.ColumnParallelLinear(
+                    config.hidden_size,
+                    projection_size,
+                    config=config,
+                    init_method=config.init_method,
+                    bias=config.add_bias_linear,
+                    gather_output=False)
 
-
-            self.key_value = tensor_parallel.ColumnParallelLinear(
-                config.hidden_size,
-                2 * projection_size,
-                config=config,
-                init_method=config.init_method,
-                bias=config.add_bias_linear,
-                gather_output=False)
+            if args.enable_lora:
+                self.key_value = LoRAColumnParallelLinear(config.hidden_size,
+                    2 * projection_size,
+                    config=config,
+                    init_method=config.init_method,
+                    bias=config.add_bias_linear,
+                    gather_output=False)
+            else:
+                self.key_value = tensor_parallel.ColumnParallelLinear(
+                    config.hidden_size,
+                    2 * projection_size,
+                    config=config,
+                    init_method=config.init_method,
+                    bias=config.add_bias_linear,
+                    gather_output=False)
 
         # Currently FlashAttention only works with causal mask
         if self.use_flash_attn_triton:
@@ -662,23 +693,24 @@ class ParallelAttention(MegatronModule):
                 self.checkpoint_core_attention = config.recompute_granularity == 'selective'
 
         # Output.
-        dense_layer = tensor_parallel.RowParallelLinear(
-            projection_size,
-            config.hidden_size,
-            config=config,
-            init_method=config.output_layer_init_method,
-            bias=args.add_bias_linear,
-            input_is_parallel=True,
-            skip_bias_add=True)
-        if args.enable_lora and 'dense' in args.lora_target_modules:
-            self.dense = LoRAParallelLinear(
-                dense_layer,
-                args.lora_rank,
-                args.lora_alpha,
-                args.lora_dropout
-            )
+        if args.enable_lora:
+            self.dense = LoRARowParallelLinear(
+                projection_size,
+                config.hidden_size,
+                config=config,
+                init_method=config.output_layer_init_method,
+                bias=args.add_bias_linear,
+                input_is_parallel=True,
+                skip_bias_add=True)
         else:
-            self.dense = dense_layer
+            tensor_parallel.RowParallelLinear(
+                projection_size,
+                config.hidden_size,
+                config=config,
+                init_method=config.output_layer_init_method,
+                bias=args.add_bias_linear,
+                input_is_parallel=True,
+                skip_bias_add=True)
 
 
     def _checkpointed_attention_forward(self, query_layer, key_layer,
@@ -961,7 +993,7 @@ def launch_chunk_attention(args, config):
         device=get_accelerator().current_device_name(), dtype=config.params_dtype))
     if config.perform_initialization:
         tensor_parallel.layers._initialize_affine_weight_gpu(qkv_linear_weight, config.init_method,
-                                        partition_dim=0)
+                                             partition_dim=0)
     qkv_linear_bias = None
     if args.add_bias_linear:
         qkv_linear_bias = Parameter(torch.empty(
@@ -978,7 +1010,7 @@ def launch_chunk_attention(args, config):
         device=get_accelerator().current_device_name(), dtype=config.params_dtype))
     if config.perform_initialization:
         tensor_parallel.layers._initialize_affine_weight_gpu(qkv_dense_weight, config.output_layer_init_method,
-                                        partition_dim=0)
+                                             partition_dim=0)
     qkv_dense_bias = None
     if args.add_bias_linear:
         qkv_dense_bias = Parameter(torch.empty(
@@ -1420,8 +1452,8 @@ class ParallelTransformerLayer(MegatronModule):
                         self.hidden_dropout)
             else:
                 out = torch.nn.functional.dropout(attention_output + attention_bias,
-                                                p=self.hidden_dropout,
-                                                training=self.training)
+                                                  p=self.hidden_dropout,
+                                                  training=self.training)
                 layernorm_input = residual + self.drop_path(out)
         else:
             if attention_bias is not None:
@@ -1509,8 +1541,8 @@ class ParallelTransformerLayer(MegatronModule):
                 if mlp_bias is not None:
                     mlp_output = mlp_output + mlp_bias
                 out = torch.nn.functional.dropout(mlp_output,
-                                                p=self.hidden_dropout,
-                                                training=self.training)
+                                                  p=self.hidden_dropout,
+                                                  training=self.training)
                 output = residual + self.drop_path(out)
         else:
             if mlp_bias is not None:
@@ -1524,53 +1556,263 @@ class ParallelTransformerLayer(MegatronModule):
 
 
 class LoRAColumnParallelLinear(tensor_parallel.ColumnParallelLinear):
-    def __init__(self, *args, lora_rank=8, lora_alpha=16, lora_dropout=0.0, **kwargs):
+    """
+    Column Parallel Linear layer with heterogeneous LoRA support.
+    
+    Initializes multiple LoRA adapters based on config lists (lora_ranks, lora_alpha, etc.).
+    All adapters in a batch execute simultaneously.
+    Supports different ranks, batch sizes, and datasets per adapter.
+    
+    Args:
+        *args: Arguments passed to ColumnParallelLinear
+        module_key: Unique identifier for this module (required for multi-LoRA)
+        **kwargs: Keyword arguments passed to ColumnParallelLinear
+    """
+    
+    def __init__(self, *args, **kwargs):
+        # Extract module_key before passing to parent
+        self.module_key = kwargs.pop('module_key', None)
+        
         super(LoRAColumnParallelLinear, self).__init__(*args, **kwargs)
-
-        self.r = lora_rank
-        self.lora_alpha = lora_alpha
-        self.lora_dropout = torch.nn.Dropout(lora_dropout)
-        self.scaling = self.lora_alpha / self.r
 
         config = kwargs['config']
         self.params_dtype = config.params_dtype
+        
+        # Get LoRA configuration from args (populated from JSON)
+        args = get_args()
+        
+        # Get multi-adapter config (required - no legacy support)
+        lora_ranks = getattr(args, 'lora_ranks')
+        lora_alphas = getattr(args, 'lora_alpha')
+        lora_dropouts = getattr(args, 'lora_dropout')
+        lora_batch_sizes = getattr(args, 'lora_batch_size')
+        
+        # Validate config
+        assert lora_ranks is not None and isinstance(lora_ranks, list), \
+            "lora_ranks must be a list in config"
+        
+        self.num_adapters = len(lora_ranks)
+        assert self.num_adapters > 0, "Must have at least one adapter"
+        
+        # Ensure all config lists have the same length
+        if not isinstance(lora_alphas, list):
+            lora_alphas = [lora_alphas] * self.num_adapters
+        if not isinstance(lora_dropouts, list):
+            lora_dropouts = [lora_dropouts] * self.num_adapters
+        if not isinstance(lora_batch_sizes, list):
+            lora_batch_sizes = [lora_batch_sizes] * self.num_adapters
+            
+        assert len(lora_alphas) == self.num_adapters, \
+            f"lora_alpha length {len(lora_alphas)} != lora_ranks length {self.num_adapters}"
+        assert len(lora_dropouts) == self.num_adapters, \
+            f"lora_dropout length {len(lora_dropouts)} != lora_ranks length {self.num_adapters}"
+        assert len(lora_batch_sizes) == self.num_adapters, \
+            f"lora_batch_size length {len(lora_batch_sizes)} != lora_ranks length {self.num_adapters}"
+        
+        # Store per-adapter configurations
+        self.adapter_ranks = lora_ranks
+        self.adapter_alphas = lora_alphas
+        self.adapter_dropouts = lora_dropouts
+        self.adapter_batch_sizes = lora_batch_sizes
+        self.adapter_scalings = [alpha / rank for alpha, rank in zip(lora_alphas, lora_ranks)]
+        
+        # Create dropout modules for each adapter
+        self.lora_dropout_modules = nn.ModuleList([
+            nn.Dropout(p=dropout) for dropout in lora_dropouts
+        ])
+        
+        # Initialize LoRA weights for each adapter
+        # Using ParameterList to properly register parameters for training
+        self.lora_A_list = nn.ParameterList()
+        self.lora_B_list = nn.ParameterList()
+        
+        for adapter_id, rank in enumerate(lora_ranks):
+            # lora_A: [rank, input_size] - not partitioned across TP
+            lora_A = nn.Parameter(torch.empty(
+                rank, self.input_size,
+                device=get_accelerator().current_device_name(),
+                dtype=self.params_dtype
+            ))
+            
+            # lora_B: [output_size_per_partition, rank] - partitioned across TP
+            lora_B = nn.Parameter(torch.empty(
+                self.output_size_per_partition, rank,
+                device=get_accelerator().current_device_name(),
+                dtype=self.params_dtype
+            ))
+            
+            # Set tensor parallel attributes for lora_A (not partitioned)
+            setattr(lora_A, "tp_register", True)
+            setattr(lora_A, "partition_dim", 1)
+            setattr(lora_A, "partition_stride", getattr(self, "stride", 1))
+            setattr(lora_A, "tensor_model_parallel", False)
+            setattr(lora_A, "adapter_id", adapter_id)
+            
+            # Set tensor parallel attributes for lora_B (partitioned along output dim)
+            setattr(lora_B, "tp_register", True)
+            setattr(lora_B, "partition_dim", 0)
+            setattr(lora_B, "partition_stride", getattr(self, "stride", 1))
+            setattr(lora_B, "tensor_model_parallel", True)
+            setattr(lora_B, "adapter_id", adapter_id)
+            
+            # Initialize weights
+            nn.init.kaiming_uniform_(lora_A, a=math.sqrt(5))
+            nn.init.zeros_(lora_B)
+            
+            self.lora_A_list.append(lora_A)
+            self.lora_B_list.append(lora_B)
 
-        self.lora_A = torch.nn.Parameter(torch.empty(
-            self.r, self.input_size,
-            device=get_accelerator().current_device_name(),
-            dtype=self.params_dtype
-        ))
-        self.lora_B = torch.nn.Parameter(torch.empty(
-            self.output_size_per_partition, self.r,
-            device=get_accelerator().current_device_name(),
-            dtype=self.params_dtype
-        ))
+    def get_adapter_params(self, adapter_id: int) -> Dict:
+        """Get parameters for a specific adapter."""
+        if adapter_id < 0 or adapter_id >= self.num_adapters:
+            raise ValueError(f"Invalid adapter_id {adapter_id}, must be in [0, {self.num_adapters})")
+        
+        return {
+            'lora_A': self.lora_A_list[adapter_id],
+            'lora_B': self.lora_B_list[adapter_id],
+            'rank': self.adapter_ranks[adapter_id],
+            'alpha': self.adapter_alphas[adapter_id],
+            'scaling': self.adapter_scalings[adapter_id],
+            'dropout': self.lora_dropout_modules[adapter_id],
+            'batch_size': self.adapter_batch_sizes[adapter_id],
+        }
 
-        setattr(self.lora_A, "tp_register", True)
-        setattr(self.lora_A, "partition_dim", 1)
-        setattr(self.lora_A, "partition_stride", getattr(self, "stride", 1))
-        setattr(self.lora_A, "tensor_model_parallel", False)
-
-        setattr(self.lora_B, "tp_register", True)
-        setattr(self.lora_B, "partition_dim", 0)
-        setattr(self.lora_B, "partition_stride", getattr(self, "stride", 1))
-        setattr(self.lora_B, "tensor_model_parallel", True)
-
-        torch.nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        torch.nn.init.zeros_(self.lora_B)
-
-    def forward(self, input_):
+    def forward(self, input_, batch_mapping: Optional[torch.Tensor] = None):
+        """
+        Forward pass with heterogeneous LoRA support.
+        
+        All adapters present in the batch execute simultaneously.
+        Supports Triton kernel path (--use-triton-lora) or PyTorch fallback.
+        
+        Args:
+            input_: Input tensor of shape [seq_len, batch_size, hidden] or [tokens, hidden]
+            batch_mapping: Tensor of shape [batch_size] mapping each sample to adapter ID (0 to num_adapters-1)
+            
+        Returns:
+            Tuple of (output, bias)
+        """
+        # Freeze base model weights during LoRA training
         self.weight.requires_grad = False
         if self.bias is not None:
             self.bias.requires_grad = False
 
+        args = get_args()
+        use_triton_kernel = getattr(args, 'use_triton_lora', False) and triton_lora_available
+
+        if batch_mapping is None:
+            # Generate mapping based on configured batch sizes
+            # e.g., if sizes are [1, 1], mapping becomes [0, 1]
+            # e.g., if sizes are [2, 1], mapping becomes [0, 0, 1]
+            mapping_list = []
+            for adapter_id, size in enumerate(self.adapter_batch_sizes):
+                mapping_list.extend([adapter_id] * size)
+            
+            batch_mapping = torch.tensor(
+                mapping_list, 
+                device=input_.device, 
+                dtype=torch.long
+            )
+
+            # Safety check: Ensure configured batch size matches actual input
+            if input_.dim() == 3:
+                # Assuming input is [seq_len, batch_size, hidden]
+                input_batch_size = input_.size(1)
+                if len(batch_mapping) != input_batch_size:
+                    raise ValueError(
+                        f"Auto-generated batch_mapping size ({len(batch_mapping)}) from 'lora_batch_size' "
+                        f"does not match input batch dimension ({input_batch_size})."
+                    )
+
+        # =================================================================
+        # TRITON KERNEL PATH: Optimized heterogeneous batch execution
+        # =================================================================
+        if use_triton_kernel and self.module_key:
+            # 1. Prepare Input for Tensor Parallelism
+            if getattr(self, "async_tensor_model_parallel_allreduce", False) \
+                    or getattr(self, "sequence_parallel", False) \
+                    or getattr(self, "is_expert_without_slicing", False):
+                input_parallel = input_
+            else:
+                input_parallel = copy_to_tensor_model_parallel_region(input_)
+
+            # 2. Reshape input to 2D [Total_Tokens, Hidden] for kernel
+            original_shape = input_parallel.shape
+            if len(original_shape) == 3:
+                S, B, H = original_shape
+                input_reshaped = input_parallel.view(-1, H)
+                # Expand batch_mapping for all sequence positions
+                batch_mapping_expanded = batch_mapping.repeat(S)
+            else:
+                input_reshaped = input_parallel
+                batch_mapping_expanded = batch_mapping
+
+            # 3. Gather ALL adapters
+            unique_ids = torch.unique(batch_mapping)
+            
+            lora_a_list = []
+            lora_b_list = []
+            scales_list = []
+            adapter_indices = []
+            
+            for uid in unique_ids:
+                adapter_id = uid.item()
+                
+                # Validate adapter_id
+                if adapter_id < 0 or adapter_id >= self.num_adapters:
+                    raise ValueError(f"Invalid adapter_id {adapter_id} in batch_mapping, must be in [0, {self.num_adapters})")
+                
+                # Get indices for this adapter in the flattened batch
+                indices = (batch_mapping_expanded == adapter_id).nonzero(as_tuple=True)[0]
+                
+                if len(indices) == 0:
+                    continue
+                
+                # Get adapter weights from internal lists
+                lora_a_list.append(self.lora_A_list[adapter_id])
+                lora_b_list.append(self.lora_B_list[adapter_id])
+                scales_list.append(self.adapter_scalings[adapter_id])
+                adapter_indices.append(indices)
+
+            # 4. Execute Triton kernel with all adapters
+            output_parallel_flat = OptimizedLoRAFunction.apply(
+                input_reshaped,
+                self.weight,
+                lora_a_list,
+                lora_b_list,
+                scales_list,
+                batch_mapping_expanded,
+                adapter_indices
+            )
+            
+            # 5. Restore original shape
+            if len(original_shape) == 3:
+                output_parallel = output_parallel_flat.view(S, B, -1)
+            else:
+                output_parallel = output_parallel_flat
+            
+            # 6. Handle bias
+            if not self.skip_bias_add and self.bias is not None:
+                output_parallel = output_parallel + self.bias
+                output_bias = None
+            else:
+                output_bias = self.bias
+
+            # 7. Gather output across TP ranks if needed
+            if getattr(self, "gather_output", False) and not getattr(self, "is_expert_without_slicing", False):
+                output = gather_from_tensor_model_parallel_region(output_parallel)
+            else:
+                output = output_parallel
+                
+            return output, output_bias
+
+        # =================================================================
+        # PYTORCH PATH: Standard heterogeneous batch execution
+        # =================================================================
+        
+        # Compute base model output
         original_output, original_bias = super().forward(input_)
 
-        from megatron.core.tensor_parallel.mappings import (
-            copy_to_tensor_model_parallel_region,
-            gather_from_tensor_model_parallel_region,
-        )
-
+        # Prepare input for LoRA computation
         if getattr(self, "async_tensor_model_parallel_allreduce", False) \
                 or getattr(self, "sequence_parallel", False) \
                 or getattr(self, "is_expert_without_slicing", False):
@@ -1578,10 +1820,45 @@ class LoRAColumnParallelLinear(tensor_parallel.ColumnParallelLinear):
         else:
             input_parallel = copy_to_tensor_model_parallel_region(input_)
 
-        lora_A_output = F.linear(self.lora_dropout(input_parallel), self.lora_A)
-        lora_B_output = F.linear(lora_A_output, self.lora_B)
-        lora_output_parallel = lora_B_output * self.scaling
+        # Initialize output tensor for LoRA contributions
+        lora_output_parallel = torch.zeros_like(original_output)
+        
+        unique_ids = torch.unique(batch_mapping)
+        
+        # Process ALL adapters in the batch simultaneously
+        for uid in unique_ids:
+            adapter_id = uid.item()
+            
+            # Validate adapter_id
+            if adapter_id < 0 or adapter_id >= self.num_adapters:
+                raise ValueError(f"Invalid adapter_id {adapter_id} in batch_mapping, must be in [0, {self.num_adapters})")
+            
+            # Get adapter weights from internal lists
+            s_A = self.lora_A_list[adapter_id]
+            s_B = self.lora_B_list[adapter_id]
+            s_scaling = self.adapter_scalings[adapter_id]
+            s_dropout = self.lora_dropout_modules[adapter_id]
+            
+            # Get indices for this adapter
+            mask = (batch_mapping == uid)
+            
+            # Apply LoRA for this adapter's samples
+            if input_parallel.dim() == 3:
+                # Shape: [seq_len, batch_size, hidden_dim]
+                batch_indices = mask.nonzero(as_tuple=True)[0]
+                if len(batch_indices) > 0:
+                    inp_slice = input_parallel[:, batch_indices, :]
+                    out_slice = self._compute_lora(inp_slice, s_A, s_B, s_scaling, s_dropout)
+                    lora_output_parallel[:, batch_indices, :] = out_slice
+            elif input_parallel.dim() == 2:
+                # Shape: [total_tokens, hidden_dim]
+                token_indices = mask.nonzero(as_tuple=True)[0]
+                if len(token_indices) > 0:
+                    inp_slice = input_parallel[token_indices, :]
+                    out_slice = self._compute_lora(inp_slice, s_A, s_B, s_scaling, s_dropout)
+                    lora_output_parallel[token_indices, :] = out_slice
 
+        # Apply tensor parallel gathering if needed
         if getattr(self, "gather_output", False) and not getattr(self, "is_expert_without_slicing", False):
             lora_output = gather_from_tensor_model_parallel_region(lora_output_parallel)
         else:
@@ -1589,62 +1866,320 @@ class LoRAColumnParallelLinear(tensor_parallel.ColumnParallelLinear):
 
         return original_output + lora_output, original_bias
 
+    def _compute_lora(self, x, A, B, scaling, dropout_module):
+        """Compute LoRA projection: output = (dropout(x) @ A^T @ B^T) * scaling"""
+        lora_A_output = F.linear(dropout_module(x), A)
+        lora_B_output = F.linear(lora_A_output, B)
+        return lora_B_output * scaling
+
 
 class LoRARowParallelLinear(tensor_parallel.RowParallelLinear):
-    def __init__(self, *args, lora_rank=8, lora_alpha=16, lora_dropout=0.0, **kwargs):
+    """
+    Row Parallel Linear layer with heterogeneous LoRA support.
+    
+    Initializes multiple LoRA adapters based on config lists (lora_ranks, lora_alpha, etc.).
+    All adapters in a batch execute simultaneously.
+    Supports different ranks, batch sizes, and datasets per adapter.
+    
+    Note: For RowParallel, lora_A is partitioned (matches input partition)
+    and lora_B is NOT partitioned (full output dimension).
+    
+    Args:
+        *args: Arguments passed to RowParallelLinear
+        module_key: Unique identifier for this module (required for multi-LoRA)
+        **kwargs: Keyword arguments passed to RowParallelLinear
+    """
+    
+    def __init__(self, *args, **kwargs):
+        self.module_key = kwargs.pop('module_key', None)
         super(LoRARowParallelLinear, self).__init__(*args, **kwargs)
-
-        self.r = lora_rank
-        self.lora_alpha = lora_alpha
-        self.lora_dropout = torch.nn.Dropout(lora_dropout)
-        self.scaling = self.lora_alpha / self.r
 
         config = kwargs['config']
         self.params_dtype = config.params_dtype
+        
+        # Get LoRA configuration from args (populated from JSON)
+        args = get_args()
+        
+        # Get multi-adapter config (required - no legacy support)
+        lora_ranks = getattr(args, 'lora_ranks')
+        lora_alphas = getattr(args, 'lora_alpha')
+        lora_dropouts = getattr(args, 'lora_dropout')
+        lora_batch_sizes = getattr(args, 'lora_batch_size')
+        
+        # Validate config
+        assert lora_ranks is not None and isinstance(lora_ranks, list), \
+            "lora_ranks must be a list in config"
+        
+        self.num_adapters = len(lora_ranks)
+        assert self.num_adapters > 0, "Must have at least one adapter"
+        
+        # Ensure all config lists have the same length
+        if not isinstance(lora_alphas, list):
+            lora_alphas = [lora_alphas] * self.num_adapters
+        if not isinstance(lora_dropouts, list):
+            lora_dropouts = [lora_dropouts] * self.num_adapters
+        if not isinstance(lora_batch_sizes, list):
+            lora_batch_sizes = [lora_batch_sizes] * self.num_adapters
+            
+        assert len(lora_alphas) == self.num_adapters, \
+            f"lora_alpha length {len(lora_alphas)} != lora_ranks length {self.num_adapters}"
+        assert len(lora_dropouts) == self.num_adapters, \
+            f"lora_dropout length {len(lora_dropouts)} != lora_ranks length {self.num_adapters}"
+        assert len(lora_batch_sizes) == self.num_adapters, \
+            f"lora_batch_size length {len(lora_batch_sizes)} != lora_ranks length {self.num_adapters}"
+        
+        # Store per-adapter configurations
+        self.adapter_ranks = lora_ranks
+        self.adapter_alphas = lora_alphas
+        self.adapter_dropouts = lora_dropouts
+        self.adapter_batch_sizes = lora_batch_sizes
+        self.adapter_scalings = [alpha / rank for alpha, rank in zip(lora_alphas, lora_ranks)]
+        
+        # Create dropout modules for each adapter
+        self.lora_dropout_modules = nn.ModuleList([
+            nn.Dropout(p=dropout) for dropout in lora_dropouts
+        ])
+        
+        # Initialize LoRA weights for each adapter
+        self.lora_A_list = nn.ParameterList()
+        self.lora_B_list = nn.ParameterList()
+        
+        for adapter_id, rank in enumerate(lora_ranks):
+            # lora_A: [rank, input_size_per_partition] - partitioned to match input
+            lora_A = nn.Parameter(torch.empty(
+                rank, self.input_size_per_partition,
+                device=get_accelerator().current_device_name(),
+                dtype=self.params_dtype
+            ))
+            
+            # lora_B: [output_size, rank] - not partitioned
+            lora_B = nn.Parameter(torch.empty(
+                self.output_size, rank,
+                device=get_accelerator().current_device_name(),
+                dtype=self.params_dtype
+            ))
+            
+            # Set tensor parallel attributes for lora_A (partitioned along input dim)
+            setattr(lora_A, "tp_register", True)
+            setattr(lora_A, "partition_dim", 1)
+            setattr(lora_A, "partition_stride", getattr(self, "stride", 1))
+            setattr(lora_A, "tensor_model_parallel", True)
+            setattr(lora_A, "adapter_id", adapter_id)
+            
+            # Set tensor parallel attributes for lora_B (not partitioned)
+            setattr(lora_B, "tp_register", True)
+            setattr(lora_B, "partition_dim", 0)
+            setattr(lora_B, "partition_stride", getattr(self, "stride", 1))
+            setattr(lora_B, "tensor_model_parallel", False)
+            setattr(lora_B, "adapter_id", adapter_id)
+            
+            # Initialize weights
+            nn.init.kaiming_uniform_(lora_A, a=math.sqrt(5))
+            nn.init.zeros_(lora_B)
+            
+            self.lora_A_list.append(lora_A)
+            self.lora_B_list.append(lora_B)
 
-        self.lora_A = torch.nn.Parameter(torch.empty(
-            self.r, self.input_size_per_partition,
-            device=get_accelerator().current_device_name(),
-            dtype=self.params_dtype
-        ))
-        self.lora_B = torch.nn.Parameter(torch.empty(
-            self.output_size, self.r,
-            device=get_accelerator().current_device_name(),
-            dtype=self.params_dtype
-        ))
+    def get_adapter_params(self, adapter_id: int) -> Dict:
+        """Get parameters for a specific adapter."""
+        if adapter_id < 0 or adapter_id >= self.num_adapters:
+            raise ValueError(f"Invalid adapter_id {adapter_id}, must be in [0, {self.num_adapters})")
+        
+        return {
+            'lora_A': self.lora_A_list[adapter_id],
+            'lora_B': self.lora_B_list[adapter_id],
+            'rank': self.adapter_ranks[adapter_id],
+            'alpha': self.adapter_alphas[adapter_id],
+            'scaling': self.adapter_scalings[adapter_id],
+            'dropout': self.lora_dropout_modules[adapter_id],
+            'batch_size': self.adapter_batch_sizes[adapter_id],
+        }
 
-        setattr(self.lora_A, "tp_register", True)
-        setattr(self.lora_A, "partition_dim", 1)
-        setattr(self.lora_A, "partition_stride", getattr(self, "stride", 1))
-        setattr(self.lora_A, "tensor_model_parallel", True)
-
-        setattr(self.lora_B, "tp_register", True)
-        setattr(self.lora_B, "partition_dim", 0)
-        setattr(self.lora_B, "partition_stride", getattr(self, "stride", 1))
-        setattr(self.lora_B, "tensor_model_parallel", False)
-
-        torch.nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        torch.nn.init.zeros_(self.lora_B)
-
-    def forward(self, input_):
+    def forward(self, input_, batch_mapping: Optional[torch.Tensor] = None):
+        """
+        Forward pass with heterogeneous LoRA support.
+        
+        All adapters present in the batch execute simultaneously.
+        Supports Triton kernel path (--use-triton-lora) or PyTorch fallback.
+        
+        Args:
+            input_: Input tensor of shape [seq_len, batch_size, hidden] or [tokens, hidden]
+            batch_mapping: Tensor of shape [batch_size] mapping each sample to adapter ID (0 to num_adapters-1)
+            
+        Returns:
+            Tuple of (output, bias)
+        """
+        # Freeze base model weights during LoRA training
         self.weight.requires_grad = False
         if self.bias is not None:
             self.bias.requires_grad = False
 
+        args = get_args()
+        use_triton_kernel = getattr(args, 'use_triton_lora', False) and triton_lora_available
+
+        if batch_mapping is None:
+            # Generate mapping based on configured batch sizes
+            # e.g., if sizes are [1, 1], mapping becomes [0, 1]
+            # e.g., if sizes are [2, 1], mapping becomes [0, 0, 1]
+            mapping_list = []
+            for adapter_id, size in enumerate(self.adapter_batch_sizes):
+                mapping_list.extend([adapter_id] * size)
+            
+            batch_mapping = torch.tensor(
+                mapping_list, 
+                device=input_.device, 
+                dtype=torch.long
+            )
+
+            # Safety check: Ensure configured batch size matches actual input
+            if input_.dim() == 3:
+                # Assuming input is [seq_len, batch_size, hidden]
+                input_batch_size = input_.size(1)
+                if len(batch_mapping) != input_batch_size:
+                    raise ValueError(
+                        f"Auto-generated batch_mapping size ({len(batch_mapping)}) from 'lora_batch_size' "
+                        f"does not match input batch dimension ({input_batch_size})."
+                    )
+
+        # =================================================================
+        # TRITON KERNEL PATH: Optimized heterogeneous batch execution
+        # =================================================================
+        if use_triton_kernel and self.module_key:
+            # 1. Prepare Input for Tensor Parallelism
+            if getattr(self, "input_is_parallel", False) or getattr(self, "is_expert_without_slicing", False):
+                input_parallel = input_
+            else:
+                input_parallel = scatter_to_tensor_model_parallel_region(input_)
+
+            # 2. Reshape input to 2D for kernel
+            original_shape = input_parallel.shape
+            if len(original_shape) == 3:
+                S, B, H = original_shape
+                input_reshaped = input_parallel.view(-1, H)
+                batch_mapping_expanded = batch_mapping.repeat(S)
+            else:
+                input_reshaped = input_parallel
+                batch_mapping_expanded = batch_mapping
+
+            # 3. Gather ALL adapters
+            unique_ids = torch.unique(batch_mapping)
+            
+            lora_a_list = []
+            lora_b_list = []
+            scales_list = []
+            adapter_indices = []
+            
+            for uid in unique_ids:
+                adapter_id = uid.item()
+                
+                # Validate adapter_id
+                if adapter_id < 0 or adapter_id >= self.num_adapters:
+                    raise ValueError(f"Invalid adapter_id {adapter_id} in batch_mapping, must be in [0, {self.num_adapters})")
+                
+                # Get indices for this adapter
+                indices = (batch_mapping_expanded == adapter_id).nonzero(as_tuple=True)[0]
+                
+                if len(indices) == 0:
+                    continue
+                
+                # Get adapter weights from internal lists
+                lora_a_list.append(self.lora_A_list[adapter_id])
+                lora_b_list.append(self.lora_B_list[adapter_id])
+                scales_list.append(self.adapter_scalings[adapter_id])
+                adapter_indices.append(indices)
+
+            # 4. Execute Triton kernel with all adapters
+            output_parallel_flat = OptimizedLoRAFunction.apply(
+                input_reshaped,
+                self.weight,
+                lora_a_list,
+                lora_b_list,
+                scales_list,
+                batch_mapping_expanded,
+                adapter_indices
+            )
+            
+            # 5. Restore shape
+            if len(original_shape) == 3:
+                output_parallel = output_parallel_flat.view(S, B, -1)
+            else:
+                output_parallel = output_parallel_flat
+
+            # 6. Reduce across TP ranks (RowParallel specific)
+            output_ = reduce_from_tensor_model_parallel_region(output_parallel)
+
+            # 7. Handle bias
+            if not self.skip_bias_add:
+                output = output_ + self.bias if self.bias is not None else output_
+                output_bias = None
+            else:
+                output = output_
+                output_bias = self.bias
+
+            return output, output_bias
+
+        # =================================================================
+        # PYTORCH PATH: Standard heterogeneous batch execution
+        # =================================================================
+        
+        # Prepare input for tensor parallelism
         if getattr(self, "input_is_parallel", False) or getattr(self, "is_expert_without_slicing", False):
             input_parallel = input_
         else:
             input_parallel = scatter_to_tensor_model_parallel_region(input_)
 
-        lora_A_output = F.linear(self.lora_dropout(input_parallel), self.lora_A)
-        lora_B_output = F.linear(lora_A_output, self.lora_B)
-        lora_output_parallel = lora_B_output * self.scaling
-
+        # Compute base model output
         output_parallel = F.linear(input_parallel, self.weight)
+
+        # Initialize LoRA output tensor
+        lora_output_parallel = torch.zeros(
+            *input_parallel.shape[:-1], self.output_size,
+            device=input_parallel.device,
+            dtype=input_parallel.dtype
+        )
+        
+        unique_ids = torch.unique(batch_mapping)
+        
+        # Process ALL adapters in the batch simultaneously
+        for uid in unique_ids:
+            adapter_id = uid.item()
+            
+            # Validate adapter_id
+            if adapter_id < 0 or adapter_id >= self.num_adapters:
+                raise ValueError(f"Invalid adapter_id {adapter_id} in batch_mapping, must be in [0, {self.num_adapters})")
+            
+            # Get adapter weights from internal lists
+            s_A = self.lora_A_list[adapter_id]
+            s_B = self.lora_B_list[adapter_id]
+            s_scaling = self.adapter_scalings[adapter_id]
+            s_dropout = self.lora_dropout_modules[adapter_id]
+            
+            # Get indices for this adapter
+            mask = (batch_mapping == uid)
+            
+            # Apply LoRA for this adapter's samples
+            if input_parallel.dim() == 3:
+                # Shape: [seq_len, batch_size, hidden_dim]
+                batch_indices = mask.nonzero(as_tuple=True)[0]
+                if len(batch_indices) > 0:
+                    inp_slice = input_parallel[:, batch_indices, :]
+                    out_slice = self._compute_lora(inp_slice, s_A, s_B, s_scaling, s_dropout)
+                    lora_output_parallel[:, batch_indices, :] = out_slice
+            elif input_parallel.dim() == 2:
+                # Shape: [total_tokens, hidden_dim]
+                token_indices = mask.nonzero(as_tuple=True)[0]
+                if len(token_indices) > 0:
+                    inp_slice = input_parallel[token_indices, :]
+                    out_slice = self._compute_lora(inp_slice, s_A, s_B, s_scaling, s_dropout)
+                    lora_output_parallel[token_indices, :] = out_slice
+        
+        # Add LoRA contribution to base output
         output_parallel = output_parallel + lora_output_parallel
 
+        # Reduce across TP ranks
         output_ = reduce_from_tensor_model_parallel_region(output_parallel)
 
+        # Handle bias
         if not self.skip_bias_add:
             output = output_ + self.bias if self.bias is not None else output_
             output_bias = None
@@ -1653,6 +2188,12 @@ class LoRARowParallelLinear(tensor_parallel.RowParallelLinear):
             output_bias = self.bias
 
         return output, output_bias
+
+    def _compute_lora(self, x, A, B, scaling, dropout_module):
+        """Compute LoRA projection: output = (dropout(x) @ A^T @ B^T) * scaling"""
+        lora_A_output = F.linear(dropout_module(x), A)
+        lora_B_output = F.linear(lora_A_output, B)
+        return lora_B_output * scaling
 
 
 class ParallelTransformerLayerPipe(ParallelTransformerLayer):
@@ -2255,18 +2796,18 @@ class ParallelTransformer(MegatronModule):
                 moe_losses = []
                 if self.checkpoint_activations:
                     hidden_states, moe_losses = self._checkpointed_forward(hidden_states,
-                                                               attention_mask,
-                                                               encoder_output,
-                                                               enc_dec_attn_mask,
-                                                               rotary_pos_emb,
-                                                               is_first_microbatch)
+                                                                           attention_mask,
+                                                                           encoder_output,
+                                                                           enc_dec_attn_mask,
+                                                                           rotary_pos_emb,
+                                                                           is_first_microbatch)
                 elif self.recompute_granularity == 'full':
                     hidden_states, moe_losses = self._checkpointed_forward(hidden_states,
-                                                               attention_mask,
-                                                               encoder_output,
-                                                               enc_dec_attn_mask,
-                                                               rotary_pos_emb,
-                                                               is_first_microbatch)
+                                                                           attention_mask,
+                                                                           encoder_output,
+                                                                           enc_dec_attn_mask,
+                                                                           rotary_pos_emb,
+                                                                           is_first_microbatch)
                 else:
                     forward_kwargs = {
                         'encoder_output': encoder_output,

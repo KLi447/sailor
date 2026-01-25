@@ -291,10 +291,9 @@ class OPTParallelAttention(MegatronModule):
 
          # Strided linear layer.
         if attention_type == AttnType.self_attn:
-            if args.enable_lora and 'qkv' in args.lora_target_modules:
+            if args.enable_lora:
                 self.query_key_value = LoRAColumnParallelLinear(
                     self.embed_dim, 3 * self.embed_dim,
-                    lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
                     config=config, gather_output=False, init_method=self.init_method
                 )
             else:
@@ -313,10 +312,9 @@ class OPTParallelAttention(MegatronModule):
             coeff)
 
         # Output.
-        if args.enable_lora and 'dense' in args.lora_target_modules:
+        if args.enable_lora:
             self.dense = LoRARowParallelLinear(
                 self.embed_dim, self.embed_dim,
-                lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
                 config=config, input_is_parallel=True, init_method=self.output_layer_init_method, skip_bias_add=True
             )
         else:
@@ -480,10 +478,9 @@ class OPTParallelTransformerLayer(MegatronModule):
 
         self.self_attn_layer_norm = LayerNorm(self.embed_dim)
         
-        if args.enable_lora and 'fc1' in args.lora_target_modules:
+        if args.enable_lora:
             self.fc1 = LoRAColumnParallelLinear(
                 self.embed_dim, args.ffn_hidden_size,
-                lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
                 config=config, gather_output=False, init_method=init_method, skip_bias_add=True
             )
         else:
@@ -492,10 +489,9 @@ class OPTParallelTransformerLayer(MegatronModule):
                 config=config, gather_output=False, init_method=init_method, skip_bias_add=True
             )
 
-        if args.enable_lora and 'fc2' in args.lora_target_modules:
+        if args.enable_lora:
             self.fc2 = LoRARowParallelLinear(
                 args.ffn_hidden_size, self.embed_dim,
-                lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
                 config=config, input_is_parallel=True, init_method=output_layer_init_method, skip_bias_add=True
             )
         else:

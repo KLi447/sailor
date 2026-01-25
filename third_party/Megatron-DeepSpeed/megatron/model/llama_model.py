@@ -37,6 +37,8 @@ import deepspeed
 from deepspeed.accelerator import get_accelerator
 from deepspeed.pipe import PipelineModule, LayerSpec
 
+from .transformer import LoRARowParallelLinear, LoRAColumnParallelLinear
+
 
 class RotaryEmbedding(torch.nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
@@ -242,40 +244,76 @@ class LlamaParallelMLP(MegatronModule):
         self.output_layer_init_method = output_layer_init_method
 
         # Project to intermediate.
-        self.gate_proj = tensor_parallel.ColumnParallelLinear(
-            args.hidden_size,
-            args.ffn_hidden_size,
-            config=config,
-            gather_output=False,
-            init_method=self.init_method,
-            skip_bias_add=True,
-            moe=moe,
-            enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
-        )
+        if args.enable_lora:
+            self.gate_proj = LoRAColumnParallelLinear(
+                args.hidden_size,
+                args.ffn_hidden_size,
+                config=config,
+                gather_output=False,
+                init_method=self.init_method,
+                skip_bias_add=True,
+                moe=moe,
+                enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
+            )
+        else:
+            self.gate_proj = tensor_parallel.ColumnParallelLinear(
+                args.hidden_size,
+                args.ffn_hidden_size,
+                config=config,
+                gather_output=False,
+                init_method=self.init_method,
+                skip_bias_add=True,
+                moe=moe,
+                enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
+            )
 
-        self.up_proj = tensor_parallel.ColumnParallelLinear(
-            args.hidden_size,
-            args.ffn_hidden_size,
-            config=config,
-            gather_output=False,
-            init_method=self.init_method,
-            skip_bias_add=True,
-            moe=moe,
-            enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
-        )
+        if args.enable_lora:
+            self.up_proj = LoRAColumnParallelLinear(
+                args.hidden_size,
+                args.ffn_hidden_size,
+                config=config,
+                gather_output=False,
+                init_method=self.init_method,
+                skip_bias_add=True,
+                moe=moe,
+                enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
+            )
+        else:
+            self.up_proj = tensor_parallel.ColumnParallelLinear(
+                args.hidden_size,
+                args.ffn_hidden_size,
+                config=config,
+                gather_output=False,
+                init_method=self.init_method,
+                skip_bias_add=True,
+                moe=moe,
+                enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
+            )
 
         self.activation_func = F.silu
 
         # Project back to h.
-        self.down_proj = tensor_parallel.RowParallelLinear(
-            args.ffn_hidden_size,
-            args.hidden_size,
-            config=config,
-            input_is_parallel=True,
-            init_method=self.output_layer_init_method,
-            skip_bias_add=True,
-            moe=moe,
-            enable_expert_tensor_parallelism=enable_expert_tensor_parallelism)
+        if args.enable_lora:
+            self.down_proj = LoRARowParallelLinear(
+                args.ffn_hidden_size,
+                args.hidden_size,
+                config=config,
+                input_is_parallel=True,
+                init_method=self.output_layer_init_method,
+                skip_bias_add=True,
+                moe=moe,
+                enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
+            )
+        else:
+            self.down_proj = tensor_parallel.RowParallelLinear(
+                args.ffn_hidden_size,
+                args.hidden_size,
+                config=config,
+                input_is_parallel=True,
+                init_method=self.output_layer_init_method,
+                skip_bias_add=True,
+                moe=moe,
+                enable_expert_tensor_parallelism=enable_expert_tensor_parallelism)
 
     def forward(self, hidden_states):
 
@@ -334,12 +372,21 @@ class LlamaParallelAttention(MegatronModule):
 
         # Strided linear layer.
         if attention_type == AttnType.self_attn:
-            self.query_key_value = tensor_parallel.ColumnParallelLinear(
-                args.hidden_size,
-                3 * projection_size,
-                config=config,
-                gather_output=False,
-                init_method=self.init_method)
+            if args.enable_lora:
+                self.query_key_value = LoRAColumnParallelLinear(
+                    args.hidden_size,
+                    3 * projection_size,
+                    config=config,
+                    gather_output=False,
+                    init_method=self.init_method
+                )
+            else:
+                self.query_key_value = tensor_parallel.ColumnParallelLinear(
+                    args.hidden_size,
+                    3 * projection_size,
+                    config=config,
+                    gather_output=False,
+                    init_method=self.init_method)
 
         coeff = None
         self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
@@ -359,13 +406,23 @@ class LlamaParallelAttention(MegatronModule):
         self.rotary_emb = RotaryEmbedding(self.hidden_size_per_attention_head)
 
         # Output.
-        self.dense = tensor_parallel.RowParallelLinear(
-            projection_size,
-            args.hidden_size,
-            config=config,
-            input_is_parallel=True,
-            init_method=self.output_layer_init_method,
-            skip_bias_add=True)
+        if args.enable_lora:
+            self.dense = LoRARowParallelLinear(
+                projection_size,
+                args.hidden_size,
+                config=config,
+                input_is_parallel=True,
+                init_method=self.output_layer_init_method,
+                skip_bias_add=True)
+
+        else:
+            self.dense = tensor_parallel.RowParallelLinear(
+                projection_size,
+                args.hidden_size,
+                config=config,
+                input_is_parallel=True,
+                init_method=self.output_layer_init_method,
+                skip_bias_add=True)
 
         if deepspeed.checkpointing.is_configured():
             global get_cuda_rng_tracker, checkpoint

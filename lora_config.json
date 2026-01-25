@@ -1,0 +1,6 @@
+{
+  "lora_ranks": [2],
+  "lora_alpha": [16],
+  "lora_dropout": [0.05],
+  "lora_batch_size": [1]
+}

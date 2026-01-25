@@ -12,7 +12,7 @@ from megatron import get_tokenizer
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
-from megatron.model import GPTModel, GPTModelPipe, LlamaModelPipe, OPTModelPipe, GPTNeoModelPipe
+from megatron.model import GPTModel, GPTModelPipe, LlamaModelPipe, OPTModelPipe, GPTNeoModelPipe, Qwen3ModelPipe
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group, update_rotary_pos_emb
@@ -79,6 +79,15 @@ def model_provider(pre_process=True, post_process=True, use_embedding=True, use_
                 model = GPTNeoModelPipe(
                     config=config,
                     num_tokentypes=0,
+                    parallel_output=True,
+                    use_embedding=use_embedding,
+                    use_transformer=use_transformer,
+                    use_last=use_last,
+                    layers_per_stage=layers_per_stage
+                )
+            elif args.model_name == "QWEN":
+                model = Qwen3ModelPipe(
+                    config=config,
                     parallel_output=True,
                     use_embedding=use_embedding,
                     use_transformer=use_transformer,
@@ -319,7 +328,11 @@ def forward_step(data_iterator, model):
             labels = labels[:, :args.curriculum_seqlen].contiguous()
         output_tensor = tensor_parallel.vocab_parallel_cross_entropy(stu_output.contiguous().float(), labels)
     else:
-        output_tensor, other_losses = model(tokens, position_ids, attention_mask,
+        if args.enable_lora:
+            output_tensor, other_losses = model(tokens, position_ids, attention_mask, batch_mapping=[0],
+                                            labels=labels)
+        else:
+            output_tensor, other_losses = model(tokens, position_ids, attention_mask,
                                             labels=labels)
     if args.curriculum_learning_legacy and args.curriculum_seqlen < args.seq_length:
         loss_mask = loss_mask[:, :args.curriculum_seqlen].contiguous()

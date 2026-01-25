@@ -64,7 +64,7 @@ from sailor.profiling.profile_utils import (
     alloc_res_mem
 )
 from sailor.Planner.baselines.Galvatron.core import GalvatronProfiler
-from sailor.Worker.chk_manager import Chk_manager
+from sailor.Worker.checkpoint.chk_manager import Chk_manager
 
 try:
     import wandb
@@ -107,7 +107,7 @@ def get_lora_params(model_chunks):
 
 def load_lora_config(args):
     args = get_args()
-    if args.lora_config_file:
+    if args.enable_lora and args.lora_config_file:
         print_rank_0(f"> Loading LoRA configuration from {args.lora_config_file}")
         with open(args.lora_config_file, 'r') as f:
             lora_config = json.load(f)
@@ -487,6 +487,13 @@ def pretrain(train_valid_test_dataset_provider,
     print(f"[RECONFIGURATION] Data setup took {time.time()-reconf_start_data_time} sec")
 
     print(f"[RECONFIGURATION] Total reconf time took {total_reconf_time} sec")
+
+    if args.enable_lora:
+        optimizer_params = get_lora_params(model)
+
+        print_rank_0(f"Found {len(optimizer_params)} trainable LoRA parameters.")
+        for param in optimizer_params:
+            param.requires_grad = True
 
     # in a while loop for restarts
     exception = False
@@ -957,17 +964,6 @@ def load_model_weights_only(model_provider_func):
 
     optimizer = None
     lr_scheduler = None
-
-    if args.enable_lora:
-        print_rank_0("LoRA is enabled. Freezing base model weights.")
-        for param in model[0].parameters():
-            param.requires_grad = False
-        
-        optimizer_params = get_lora_params(model)
-
-        print_rank_0(f"Found {len(optimizer_params)} trainable LoRA parameters.")
-        for param in optimizer_params:
-            param.requires_grad = True
 
     if args.deepspeed:
         # When loading just the model weights, ZeRO can be disabled.
