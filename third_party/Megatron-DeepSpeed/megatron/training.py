@@ -1136,10 +1136,10 @@ def setup_model_and_optimizer(model_provider_func,
 def get_opt_state(state_dict):
     num_opt_params = 0
     num_opt_bytes = 0
-    for _,v in state_dict['state'].items():
-        for _, vi in v.items():
-            num_opt_params += vi.numel()
-            num_opt_bytes += vi.numel() * vi.element_size()
+    # for _,v in state_dict['state'].items():
+    #     for _, vi in v.items():
+    #         num_opt_params += vi.numel()
+    #         num_opt_bytes += vi.numel() * vi.element_size()
 
     #print(f"OPTIMIZER: num_opt_params {num_opt_params}, num_opt_bytes {num_opt_bytes}")
 
