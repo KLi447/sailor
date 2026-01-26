@@ -17,6 +17,7 @@ from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 import os
 from pathlib import Path
 import re
+import gc
 import copy
 
 from megatron import get_args
@@ -54,7 +55,7 @@ from deepspeed.accelerator import get_accelerator
 from deepspeed.compression.compress import init_compression, redundancy_clean
 from deepspeed.runtime.data_pipeline.data_routing.helper import convert_to_random_ltd
 from megatron.model.transformer import ParallelTransformerLayer
-from megatron.model import LlamaModelPipe, GPTModelPipe
+from megatron.model import LlamaModelPipe, GPTModelPipe, Qwen3ModelPipe
 from deepspeed.utils.timer import STEP_MICRO_TIMER
 
 from deepspeed import comm as dist
@@ -549,7 +550,7 @@ def pretrain(train_valid_test_dataset_provider,
 
             # TODO: adjust
             last_idx = args.num_layers + 3 # transformer start from 3 for some reason
-            if isinstance(model[0].module, LlamaModelPipe):
+            if isinstance(model[0].module, LlamaModelPipe) or isinstance(model[0].module, Qwen3ModelPipe):
                 last_idx += 2
 
             res_dict_time = {}
@@ -578,7 +579,7 @@ def pretrain(train_valid_test_dataset_provider,
                     res_dict_time[str(i+1)] = [time_fwd_avg["4"], time_bwd_avg["4"], mean_opt_time_sec]
                     res_dict_mem[str(i+1)] = collect_mem_info(["4"], 1, 1)
 
-            if isinstance(model[0].module, LlamaModelPipe):
+            if isinstance(model[0].module, LlamaModelPipe) or isinstance(model[0].module, Qwen3ModelPipe):
                 rms_norm = str(num_transformer_layers_original+1)
                 head_loss = str(num_transformer_layers_original+2)
 
@@ -1780,6 +1781,8 @@ def train(start_iteration, forward_step_func, model, optimizer, opt_param_schedu
 
                 # end_checkp = time.time()
                 # print(f"Checkpoint time was {end_checkp-start_checkp} sec")
+        gc.collect() 
+        torch.cuda.empty_cache()
 
     return iteration, False
 
