@@ -18,7 +18,7 @@ class LoRAConfig:
 
 @dataclass
 class NanoFlowConfig:
-    initial_nano_batch: int = 65536
+    initial_nano_batch: int = 16384
     min_nano_batch: int = 1024
     max_nano_batch: int = 2e20
 
